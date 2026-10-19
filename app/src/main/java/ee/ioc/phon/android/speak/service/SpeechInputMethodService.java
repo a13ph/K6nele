@@ -1,11 +1,14 @@
 package ee.ioc.phon.android.speak.service;
 
+import android.Manifest;
 import android.app.Dialog;
+import android.content.BroadcastReceiver;
 import android.content.ClipData;
 import android.content.ClipboardManager;
 import android.content.ComponentName;
 import android.content.Context;
 import android.content.Intent;
+import android.content.IntentFilter;
 import android.content.SharedPreferences;
 import android.content.res.Resources;
 import android.inputmethodservice.InputMethodService;
@@ -53,6 +56,35 @@ public class SpeechInputMethodService extends InputMethodService {
     private static final String REWRITES_NAME_FREQUENT = "#f";
     private static final String REWRITES_NAME_CLIP = "#c";
 
+    // Push-to-talk: start listening on PTT_START, stop listening on PTT_STOP, and once the
+    // transcription has been committed, switch back to the previous IME.
+    public static final String ACTION_PTT_START = "ee.ioc.phon.android.speak.action.PTT_START";
+    public static final String ACTION_PTT_STOP = "ee.ioc.phon.android.speak.action.PTT_STOP";
+    // PTT_START can arrive before the input view is shown, e.g. right after the IME was selected.
+    private static final long PTT_PENDING_MS = 3000;
+
+    private final BroadcastReceiver mPttReceiver = new BroadcastReceiver() {
+        @Override
+        public void onReceive(Context context, Intent intent) {
+            Log.i("onReceive: " + intent.getAction());
+            if (ACTION_PTT_START.equals(intent.getAction())) {
+                if (mIsInputViewStarted) {
+                    startPtt();
+                } else {
+                    mPttPendingUntil = System.currentTimeMillis() + PTT_PENDING_MS;
+                }
+            } else if (ACTION_PTT_STOP.equals(intent.getAction())) {
+                mPttPendingUntil = 0;
+                if (mIsPtt && mInputView != null) {
+                    mInputView.stopListening();
+                }
+            }
+        }
+    };
+    private boolean mIsInputViewStarted;
+    private boolean mIsPtt;
+    private long mPttPendingUntil;
+
     private boolean mFlagPersonalizedLearning = true;
     private InputMethodManager mInputMethodManager;
     private SpeechInputView mInputView;
@@ -91,6 +123,32 @@ public class SpeechInputMethodService extends InputMethodService {
                 }
             });
         }
+
+        // The receiver must be exported because the PTT broadcasts come from the shell (am broadcast),
+        // run by a root helper that watches the volume key. Requiring the sender to hold
+        // WRITE_SECURE_SETTINGS limits the senders to the shell, root and system apps: normal apps
+        // cannot get this permission, so they cannot start the microphone through this receiver.
+        IntentFilter filter = new IntentFilter();
+        filter.addAction(ACTION_PTT_START);
+        filter.addAction(ACTION_PTT_STOP);
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
+            registerReceiver(mPttReceiver, filter, Manifest.permission.WRITE_SECURE_SETTINGS, null, Context.RECEIVER_EXPORTED);
+        } else {
+            registerReceiver(mPttReceiver, filter, Manifest.permission.WRITE_SECURE_SETTINGS, null);
+        }
+    }
+
+    @Override
+    public void onDestroy() {
+        Log.i("onDestroy");
+        unregisterReceiver(mPttReceiver);
+        super.onDestroy();
+    }
+
+    private void startPtt() {
+        mPttPendingUntil = 0;
+        mIsPtt = true;
+        mInputView.start();
     }
 
     /**
@@ -211,6 +269,7 @@ public class SpeechInputMethodService extends InputMethodService {
         closeSession();
 
         if (restarting) {
+            startPendingPtt();
             return;
         }
 
@@ -222,6 +281,15 @@ public class SpeechInputMethodService extends InputMethodService {
             Log.i("Auto-starting");
             mInputView.start();
         }
+        startPendingPtt();
+    }
+
+    private void startPendingPtt() {
+        mIsInputViewStarted = true;
+        if (System.currentTimeMillis() < mPttPendingUntil) {
+            startPtt();
+        }
+        mPttPendingUntil = 0;
     }
 
     /**
@@ -236,6 +304,7 @@ public class SpeechInputMethodService extends InputMethodService {
         // TODO: maybe do not call super
         super.onFinishInputView(finishingInput);
         Log.i("onFinishInputView: " + finishingInput);
+        mIsInputViewStarted = false;
         if (!finishingInput) {
             closeSession();
         }
@@ -252,6 +321,7 @@ public class SpeechInputMethodService extends InputMethodService {
         // TODO: maybe do not call super
         super.onFinishInput();
         Log.i("onFinishInput");
+        mIsInputViewStarted = false;
         closeSession();
     }
 
@@ -266,6 +336,7 @@ public class SpeechInputMethodService extends InputMethodService {
     }
 
     private void closeSession() {
+        mIsPtt = false;
         if (mInputView != null) {
             mInputView.cancel();
         }
@@ -548,6 +619,15 @@ public class SpeechInputMethodService extends InputMethodService {
                     Intent intent = new Intent(SpeechInputMethodService.this, PermissionsRequesterActivity.class);
                     intent.addFlags(Intent.FLAG_ACTIVITY_NEW_TASK);
                     SpeechInputMethodService.this.startActivity(intent);
+                }
+            }
+
+            @Override
+            public void onEndOfSession() {
+                // A push-to-talk take ends by returning to the previous IME.
+                if (mIsPtt) {
+                    mIsPtt = false;
+                    switchToLastIme();
                 }
             }
         };

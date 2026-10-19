@@ -113,4 +113,9 @@ public abstract class AbstractSpeechInputViewListener implements SpeechInputView
     public void onError(int errorCode) {
         // empty
     }
+
+    @Override
+    public void onEndOfSession() {
+        // empty
+    }
 }

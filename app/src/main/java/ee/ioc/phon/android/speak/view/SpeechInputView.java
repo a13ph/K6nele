@@ -75,6 +75,20 @@ public class SpeechInputView extends LinearLayoutCompat {
     private String mAppId = "";
     private SpeechInputViewListener mListener;
     private SpeechRecognizer mRecognizer;
+    private ComponentName mRecognizerService;
+
+    // Creating a new recognizer right after destroying the previous one can fail with
+    // ERROR_CLIENT ("Service is unbinding") or ERROR_RECOGNIZER_BUSY, because the system has not
+    // yet released the old connection. Such an error before the session has started is retried
+    // a few times, without showing it.
+    private static final int RETRY_MAX = 3;
+    private static final int RETRY_DELAY_MS = 400;
+    private static final long RETRY_WINDOW_MS = 2000;
+    private final Runnable mRetry = this::retryListening;
+    private Intent mIntent;
+    private boolean mIsRetryAllowed;
+    private int mRetryCount;
+    private long mStartTime;
 
     private MicButton.State mState;
 
@@ -153,6 +167,11 @@ public class SpeechInputView extends LinearLayoutCompat {
         void onStartListening();
 
         void onStopListening();
+
+        /**
+         * The recognition session has ended: with results, without results, or with an error.
+         */
+        void onEndOfSession();
     }
 
     public SpeechInputView(Context context, AttributeSet attrs) {
@@ -442,7 +461,7 @@ public class SpeechInputView extends LinearLayoutCompat {
             }
         });
 
-        updateServiceLanguage(mComboSelectorView.getSpeechRecognizer());
+        cancelOrDestroy();
 
         if (mTvInstruction != null) {
             if (PreferenceUtils.getPrefBoolean(prefs, res, keyHelpText, defaultHelpText)) {
@@ -500,14 +519,18 @@ public class SpeechInputView extends LinearLayoutCompat {
         switch (mState) {
             case INIT:
             case ERROR:
-                startListening(mComboSelectorView.getSpeechRecognizer(), mComboSelectorView.getIntent());
+                startListening(mComboSelectorView.getIntent());
                 break;
             case RECORDING:
                 stopListening();
                 break;
             case LISTENING:
             case TRANSCRIBING:
-                cancelOrDestroy();
+                // Cancel the session but keep the recognizer for the next tap.
+                if (mRecognizer != null) {
+                    mRecognizer.cancel();
+                }
+                mBtnType = "Y";
                 setGuiInitState(0);
                 break;
             default:
@@ -517,15 +540,23 @@ public class SpeechInputView extends LinearLayoutCompat {
     public void start() {
         if (mState == MicButton.State.INIT || mState == MicButton.State.ERROR) {
             // TODO: fix this
-            startListening(mComboSelectorView.getSpeechRecognizer(), mComboSelectorView.getIntent());
+            startListening(mComboSelectorView.getIntent());
         }
     }
 
-    // TODO: make public?
-    private void stopListening() {
-        if (mRecognizer != null) {
-            mRecognizer.stopListening();
+    public void stopListening() {
+        mIsRetryAllowed = false;
+        if (mRecognizer == null || mState == MicButton.State.INIT || mState == MicButton.State.ERROR) {
+            // Nothing is recording (e.g. a retry is pending), so there is nothing to transcribe.
+            removeCallbacks(mRetry);
+            if (mState == MicButton.State.WAITING) {
+                setGuiInitState(0);
+            }
+            mListener.onStopListening();
+            mListener.onEndOfSession();
+            return;
         }
+        mRecognizer.stopListening();
         mListener.onStopListening();
     }
 
@@ -827,24 +858,56 @@ public class SpeechInputView extends LinearLayoutCompat {
         }
     }
 
-    private void updateServiceLanguage(SpeechRecognizer sr) {
-        cancelOrDestroy();
-        mRecognizer = sr;
+    /**
+     * Keeps one recognizer per service, rather than creating a new one for every session,
+     * because the system unbinds the service asynchronously after the last recognizer is destroyed.
+     */
+    private void updateServiceLanguage() {
+        ComponentName service = mComboSelectorView.getService();
+        if (mRecognizer != null && service != null && service.equals(mRecognizerService)) {
+            return;
+        }
+        if (mRecognizer != null) {
+            mRecognizer.destroy();
+        }
+        mRecognizer = mComboSelectorView.getSpeechRecognizer();
+        mRecognizerService = service;
         mRecognizer.setRecognitionListener(new SpeechInputRecognitionListener());
     }
 
-    private void startListening(SpeechRecognizer sr, Intent intent) {
+    private void startListening(Intent intent) {
+        mIntent = intent;
+        mRetryCount = 0;
+        mStartTime = System.currentTimeMillis();
+        startListening();
+    }
+
+    private void retryListening() {
+        if (mState == MicButton.State.WAITING) {
+            mRetryCount++;
+            Log.i("Retrying startListening: " + mRetryCount);
+            startListening();
+        }
+    }
+
+    private void startListening() {
+        Intent intent = mIntent;
+        mIsRetryAllowed = true;
         setGuiState(MicButton.State.WAITING);
-        updateServiceLanguage(sr);
+        updateServiceLanguage();
         try {
             mRecognizer.startListening(intent);
-            mListener.onStartListening();
+            if (mRetryCount == 0) {
+                mListener.onStartListening();
+            }
             // Increases the counter of the app that calls the recognition service.
             // TODO: we could define it slightly differently, e.g. only count successful recognitions,
             // count also commands executed via swipes and/or buttons (but maybe not count every deletion
             // and cursor movement).
             // TODO: we could also count languages, services, etc.
-            PackageNameRegistry.increaseAppCount(getContext(), intent.getExtras(), null);
+            if (mRetryCount == 0) {
+                PackageNameRegistry.increaseAppCount(getContext(), intent.getExtras(), null);
+            }
         } catch (SecurityException e) {
             // TODO: review this.
             // On Android 11 we get the SecurityException when calling "Kõnele service" and Kõnele does not
@@ -860,10 +923,33 @@ public class SpeechInputView extends LinearLayoutCompat {
      */
     private void cancelOrDestroy() {
         mBtnType = "Y";
+        mIsRetryAllowed = false;
+        removeCallbacks(mRetry);
         if (mRecognizer != null) {
             mRecognizer.destroy();
             mRecognizer = null;
         }
+    }
+
+    /**
+     * Returns true if the error was caused by the previous session still holding the service,
+     * and a retry was scheduled.
+     */
+    private boolean retryOnError(int errorCode) {
+        if (!mIsRetryAllowed
+                || (errorCode != SpeechRecognizer.ERROR_CLIENT && errorCode != SpeechRecognizer.ERROR_RECOGNIZER_BUSY)
+                || mRetryCount >= RETRY_MAX
+                || System.currentTimeMillis() - mStartTime > RETRY_WINDOW_MS) {
+            return false;
+        }
+        mIsRetryAllowed = false;
+        // The connection might be unusable, so we start again with a new recognizer.
+        if (mRecognizer != null) {
+            mRecognizer.destroy();
+            mRecognizer = null;
+        }
+        postDelayed(mRetry, RETRY_DELAY_MS);
+        return true;
     }
 
     private class SpeechInputRecognitionListener implements RecognitionListener {
@@ -871,6 +957,7 @@ public class SpeechInputView extends LinearLayoutCompat {
         @Override
         public void onReadyForSpeech(Bundle params) {
             Log.i("onReadyForSpeech: state = " + mState);
+            mIsRetryAllowed = false;
             setGuiState(MicButton.State.LISTENING);
             if (mBSmallMic != null) {
                 mBSmallMic.setColorFilter(MicButton.COLOR_LISTENING);
@@ -883,6 +970,7 @@ public class SpeechInputView extends LinearLayoutCompat {
         @Override
         public void onBeginningOfSpeech() {
             Log.i("onBeginningOfSpeech: state = " + mState);
+            mIsRetryAllowed = false;
             setGuiState(MicButton.State.RECORDING);
             mBtnType = "R";
             setVisibility(findViewById(R.id.rlKeyButtons), View.INVISIBLE);
@@ -931,6 +1019,14 @@ public class SpeechInputView extends LinearLayoutCompat {
         @Override
         public void onError(final int errorCode) {
             Log.i("onError: " + errorCode);
+            if (retryOnError(errorCode)) {
+                return;
+            }
+            mIsRetryAllowed = false;
+            if (errorCode == SpeechRecognizer.ERROR_CLIENT || errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY) {
+                // Do not reuse a recognizer whose connection might be unusable.
+                cancelOrDestroy();
+            }
             mListener.onError(errorCode);
 
             switch (errorCode) {
@@ -970,11 +1066,13 @@ public class SpeechInputView extends LinearLayoutCompat {
                     break;
             }
             mBtnType = "Y";
+            mListener.onEndOfSession();
         }
 
         @Override
         public void onPartialResults(final Bundle bundle) {
             Log.i("onPartialResults: state = " + mState);
+            mIsRetryAllowed = false;
             ArrayList<String> results = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
             if (results != null && !results.isEmpty()) {
                 // This can be true only with kaldi-gstreamer-server
@@ -1008,6 +1106,8 @@ public class SpeechInputView extends LinearLayoutCompat {
             }
             setGuiInitState(0);
             mBtnType = "Y";
+            mIsRetryAllowed = false;
+            mListener.onEndOfSession();
         }
 
         @Override
@@ -1019,6 +1119,7 @@ public class SpeechInputView extends LinearLayoutCompat {
         @Override
         public void onBufferReceived(byte[] buffer) {
             Log.i("View: onBufferReceived: " + buffer.length);
+            mIsRetryAllowed = false;
             mListener.onBufferReceived(buffer);
         }
     }
