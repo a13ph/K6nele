@@ -417,6 +417,39 @@ public class SpeechInputMethodService extends InputMethodService {
         return extras;
     }
 
+    /**
+     * Types the final result into the field, or runs it as a command, and updates the tables of
+     * recent and frequent utterances.
+     */
+    private void commitResults(List<String> results) {
+        String text = getText(results);
+        CommandEditorResult editorResult = mCommandEditor.commitFinalResult(text);
+        if (editorResult != null && mInputView != null && editorResult.isCommand()) {
+            mInputView.showMessage(editorResult.getRewrite().ppCommand(), editorResult.isSuccess());
+        }
+        if (editorResult != null && mFlagPersonalizedLearning) {
+            boolean isSelected = false;
+            Rewrites rewritesRec = new Rewrites(mPrefs, mRes, REWRITES_NAME_RECENT);
+            if (rewritesRec.isSelected()) {
+                isSelected = true;
+                UtteranceRewriter ur = mRuleManager.addRecent(editorResult, rewritesRec.getRewrites());
+                PreferenceUtils.putPrefMapEntry(mPrefs, mRes, R.string.keyRewritesMap, REWRITES_NAME_RECENT, ur.toTsv());
+            }
+            Rewrites rewritesFreq = new Rewrites(mPrefs, mRes, REWRITES_NAME_FREQUENT);
+            if (rewritesFreq.isSelected()) {
+                isSelected = true;
+                UtteranceRewriter ur = mRuleManager.addFrequent(editorResult, rewritesFreq.getRewrites());
+                PreferenceUtils.putPrefMapEntry(mPrefs, mRes, R.string.keyRewritesMap, REWRITES_NAME_FREQUENT, ur.toTsv());
+            }
+            // Update rewriters because the tables have changed
+            if (isSelected) {
+                mCommandEditor.setRewriters(
+                        Utils.makeList(
+                                Utils.genRewriters(mPrefs, mRes, null, mRuleManager.getCommandMatcher())));
+            }
+        }
+    }
+
     private SpeechInputView.SpeechInputViewListener getSpeechInputViewListener(final Window window, final ComponentName app, RuleManager ruleManager) {
         return new AbstractSpeechInputViewListener() {
 
@@ -433,35 +466,6 @@ public class SpeechInputMethodService extends InputMethodService {
                         window.addFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
                     } else {
                         window.clearFlags(WindowManager.LayoutParams.FLAG_KEEP_SCREEN_ON);
-                    }
-                }
-            }
-
-            private void commitResults(List<String> results) {
-                String text = getText(results);
-                CommandEditorResult editorResult = mCommandEditor.commitFinalResult(text);
-                if (editorResult != null && mInputView != null && editorResult.isCommand()) {
-                    mInputView.showMessage(editorResult.getRewrite().ppCommand(), editorResult.isSuccess());
-                }
-                if (editorResult != null && mFlagPersonalizedLearning) {
-                    boolean isSelected = false;
-                    Rewrites rewritesRec = new Rewrites(mPrefs, mRes, REWRITES_NAME_RECENT);
-                    if (rewritesRec.isSelected()) {
-                        isSelected = true;
-                        UtteranceRewriter ur = mRuleManager.addRecent(editorResult, rewritesRec.getRewrites());
-                        PreferenceUtils.putPrefMapEntry(mPrefs, mRes, R.string.keyRewritesMap, REWRITES_NAME_RECENT, ur.toTsv());
-                    }
-                    Rewrites rewritesFreq = new Rewrites(mPrefs, mRes, REWRITES_NAME_FREQUENT);
-                    if (rewritesFreq.isSelected()) {
-                        isSelected = true;
-                        UtteranceRewriter ur = mRuleManager.addFrequent(editorResult, rewritesFreq.getRewrites());
-                        PreferenceUtils.putPrefMapEntry(mPrefs, mRes, R.string.keyRewritesMap, REWRITES_NAME_FREQUENT, ur.toTsv());
-                    }
-                    // Update rewriters because the tables have changed
-                    if (isSelected) {
-                        mCommandEditor.setRewriters(
-                                Utils.makeList(
-                                        Utils.genRewriters(mPrefs, mRes, null, mRuleManager.getCommandMatcher())));
                     }
                 }
             }
