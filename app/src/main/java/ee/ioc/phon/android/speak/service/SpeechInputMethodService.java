@@ -14,8 +14,11 @@ import android.content.res.Resources;
 import android.inputmethodservice.InputMethodService;
 import android.os.Build;
 import android.os.Bundle;
+import android.os.Handler;
 import android.os.IBinder;
+import android.os.Looper;
 import android.preference.PreferenceManager;
+import android.speech.RecognitionListener;
 import android.speech.SpeechRecognizer;
 import android.text.InputType;
 import android.view.View;
@@ -31,10 +34,13 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.core.content.ContextCompat;
 
+import java.util.ArrayList;
 import java.util.List;
+import java.util.Objects;
 
 import ee.ioc.phon.android.speak.Log;
 import ee.ioc.phon.android.speak.R;
+import ee.ioc.phon.android.speak.ServiceLanguageChooser;
 import ee.ioc.phon.android.speak.activity.PermissionsRequesterActivity;
 import ee.ioc.phon.android.speak.model.CallerInfo;
 import ee.ioc.phon.android.speak.model.Rewrites;
@@ -59,10 +65,21 @@ public class SpeechInputMethodService extends InputMethodService {
 
     // Push-to-talk: start listening on PTT_START, stop listening on PTT_STOP, and once the
     // transcription has been committed, switch back to the previous IME.
+    // If the keyboard panel is not shown, the take runs without it (a headless take): the text is
+    // typed into the focused field, or put on the clipboard if no field is focused. A headless take
+    // does not switch the IME back; the helper that sent the broadcasts does that.
     public static final String ACTION_PTT_START = "ee.ioc.phon.android.speak.action.PTT_START";
     public static final String ACTION_PTT_STOP = "ee.ioc.phon.android.speak.action.PTT_STOP";
-    // PTT_START can arrive before the input view is shown, e.g. right after the IME was selected.
-    private static final long PTT_PENDING_MS = 3000;
+    // PTT_START can arrive just before the input view is shown, e.g. right after the IME was
+    // selected. If the view has not started after this long, the take runs headless.
+    private static final long PTT_VIEW_WAIT_MS = 400;
+    // Same retry as in SpeechInputView: a new recognizer can be refused while Android still closes
+    // the previous connection to the service.
+    private static final int HEADLESS_RETRY_MAX = 3;
+    private static final int HEADLESS_RETRY_DELAY_MS = 400;
+    private static final long HEADLESS_RETRY_WINDOW_MS = 2000;
+    // Logged whatever Log.DEBUG says, so that a failed take can be read from logcat.
+    private static final String PTT_TAG = "k6nele-ptt";
 
     private final BroadcastReceiver mPttReceiver = new BroadcastReceiver() {
         @Override
@@ -72,19 +89,38 @@ public class SpeechInputMethodService extends InputMethodService {
                 if (mIsInputViewStarted) {
                     startPtt();
                 } else {
-                    mPttPendingUntil = System.currentTimeMillis() + PTT_PENDING_MS;
+                    mIsPttPending = true;
+                    mHandler.removeCallbacks(mStartHeadless);
+                    mHandler.postDelayed(mStartHeadless, PTT_VIEW_WAIT_MS);
                 }
             } else if (ACTION_PTT_STOP.equals(intent.getAction())) {
-                mPttPendingUntil = 0;
+                mIsPttPending = false;
+                mHandler.removeCallbacks(mStartHeadless);
                 if (mIsPtt && mInputView != null) {
                     mInputView.stopListening();
                 }
+                stopHeadless();
             }
         }
     };
+    private final Handler mHandler = new Handler(Looper.getMainLooper());
+    private final Runnable mStartHeadless = this::startHeadless;
+    private final Runnable mRetryHeadless = this::listenHeadless;
     private boolean mIsInputViewStarted;
     private boolean mIsPtt;
-    private long mPttPendingUntil;
+    private boolean mIsPttPending;
+
+    // The headless take. The recognizer is kept between takes, like the keyboard panel keeps its own.
+    private SpeechRecognizer mHeadlessRecognizer;
+    private ComponentName mHeadlessService;
+    private String mHeadlessLanguage;
+    private ComponentName mHeadlessApp;
+    private Intent mHeadlessIntent;
+    private boolean mIsHeadless;
+    private boolean mIsHeadlessStopped;
+    private boolean mIsHeadlessRetryAllowed;
+    private int mHeadlessRetryCount;
+    private long mHeadlessStartTime;
 
     private boolean mFlagPersonalizedLearning = true;
     private InputMethodManager mInputMethodManager;
@@ -140,13 +176,214 @@ public class SpeechInputMethodService extends InputMethodService {
     public void onDestroy() {
         Log.i("onDestroy");
         unregisterReceiver(mPttReceiver);
+        mHandler.removeCallbacks(mStartHeadless);
+        mHandler.removeCallbacks(mRetryHeadless);
+        if (mIsHeadless) {
+            android.util.Log.i(PTT_TAG, "headless take cancelled: keyboard service destroyed");
+        }
+        mIsHeadless = false;
+        destroyHeadlessRecognizer();
         super.onDestroy();
     }
 
     private void startPtt() {
-        mPttPendingUntil = 0;
+        mIsPttPending = false;
+        mHandler.removeCallbacks(mStartHeadless);
         mIsPtt = true;
         mInputView.start();
+    }
+
+    /**
+     * Starts a push-to-talk take without the keyboard panel, with the service, language and
+     * settings of the combo that the panel would use for the focused app.
+     */
+    private void startHeadless() {
+        if (!mIsPttPending) {
+            return;
+        }
+        mIsPttPending = false;
+        if (mIsHeadless) {
+            android.util.Log.i(PTT_TAG, "headless take already running");
+            return;
+        }
+        EditorInfo editorInfo = getCurrentInputEditorInfo();
+        String packageName = editorInfo == null ? null : editorInfo.packageName;
+        mHeadlessApp = packageName == null ? null : new ComponentName(packageName, packageName);
+        CallerInfo callerInfo = editorInfo == null
+                ? new CallerInfo(makeExtras(), (ComponentName) null)
+                : new CallerInfo(makeExtras(), editorInfo, getPackageName());
+        ServiceLanguageChooser slc = new ServiceLanguageChooser(this, mPrefs, R.array.keysIme, callerInfo,
+                mHeadlessApp == null ? "" : mHeadlessApp.flattenToShortString());
+        ComponentName service = slc.getService();
+        if (mHeadlessRecognizer != null && !Objects.equals(service, mHeadlessService)) {
+            destroyHeadlessRecognizer();
+        }
+        mHeadlessService = service;
+        mHeadlessLanguage = slc.getLanguage();
+        mHeadlessIntent = slc.getIntent();
+        mIsHeadless = true;
+        mIsHeadlessStopped = false;
+        mHeadlessRetryCount = 0;
+        mHeadlessStartTime = System.currentTimeMillis();
+        android.util.Log.i(PTT_TAG, "headless take: " + slc.getCombo() + " for " + packageName);
+        listenHeadless();
+    }
+
+    private void listenHeadless() {
+        if (!mIsHeadless) {
+            return;
+        }
+        if (mIsHeadlessStopped) {
+            // The key came up while a retry was pending, so nothing was recorded.
+            endHeadless();
+            return;
+        }
+        if (mHeadlessRecognizer == null) {
+            mHeadlessRecognizer = SpeechRecognizer.createSpeechRecognizer(this, mHeadlessService);
+            mHeadlessRecognizer.setRecognitionListener(new HeadlessRecognitionListener());
+        }
+        mIsHeadlessRetryAllowed = true;
+        try {
+            mHeadlessRecognizer.startListening(mHeadlessIntent);
+        } catch (SecurityException e) {
+            android.util.Log.i(PTT_TAG, "headless take refused: " + e);
+            endHeadless();
+        }
+    }
+
+    /**
+     * Stops recording; the recorded audio is still transcribed.
+     */
+    private void stopHeadless() {
+        if (!mIsHeadless || mIsHeadlessStopped) {
+            return;
+        }
+        mIsHeadlessStopped = true;
+        mIsHeadlessRetryAllowed = false;
+        if (mHeadlessRecognizer == null) {
+            // A retry is pending, nothing is recording.
+            endHeadless();
+        } else {
+            mHeadlessRecognizer.stopListening();
+        }
+    }
+
+    private void endHeadless() {
+        mIsHeadless = false;
+        mIsHeadlessRetryAllowed = false;
+        mHandler.removeCallbacks(mRetryHeadless);
+    }
+
+    private void destroyHeadlessRecognizer() {
+        if (mHeadlessRecognizer != null) {
+            mHeadlessRecognizer.destroy();
+            mHeadlessRecognizer = null;
+        }
+    }
+
+    /**
+     * Types the text of a headless take into the focused field, the way the keyboard panel does.
+     * If no field is focused (or it is a password field), puts the text on the clipboard instead.
+     */
+    private void deliverHeadless(List<String> results) {
+        String text = getText(results);
+        if (text.isEmpty()) {
+            return;
+        }
+        InputConnection ic = getCurrentInputConnection();
+        EditorInfo editorInfo = getCurrentInputEditorInfo();
+        if (getCurrentInputStarted() && ic != null && editorInfo != null
+                && editorInfo.inputType != InputType.TYPE_NULL && !isPassword(editorInfo)) {
+            ((InputConnectionCommandEditor) mCommandEditor).setInputConnection(ic);
+            mRuleManager.setMatchers(mHeadlessLanguage, mHeadlessService, mHeadlessApp);
+            // Also resets the editor, which reads the text before the cursor.
+            mCommandEditor.setRewriters(
+                    Utils.makeList(
+                            Utils.genRewriters(mPrefs, mRes, null, mRuleManager.getCommandMatcher())));
+            commitResults(results);
+            android.util.Log.i(PTT_TAG, "headless take typed " + text.length() + " chars");
+        } else {
+            ClipboardManager clipboard = (ClipboardManager) getSystemService(Context.CLIPBOARD_SERVICE);
+            clipboard.setPrimaryClip(ClipData.newPlainText(getString(R.string.labelApp), text));
+            android.util.Log.i(PTT_TAG, "headless take copied " + text.length() + " chars");
+        }
+    }
+
+    private static boolean isPassword(EditorInfo editorInfo) {
+        if ((editorInfo.inputType & InputType.TYPE_MASK_CLASS) != InputType.TYPE_CLASS_TEXT) {
+            return false;
+        }
+        int variation = editorInfo.inputType & InputType.TYPE_MASK_VARIATION;
+        return variation == InputType.TYPE_TEXT_VARIATION_PASSWORD
+                || variation == InputType.TYPE_TEXT_VARIATION_VISIBLE_PASSWORD
+                || variation == InputType.TYPE_TEXT_VARIATION_WEB_PASSWORD;
+    }
+
+    private class HeadlessRecognitionListener implements RecognitionListener {
+
+        @Override
+        public void onReadyForSpeech(Bundle params) {
+            mIsHeadlessRetryAllowed = false;
+        }
+
+        @Override
+        public void onBeginningOfSpeech() {
+            mIsHeadlessRetryAllowed = false;
+        }
+
+        @Override
+        public void onRmsChanged(float rmsdB) {
+        }
+
+        @Override
+        public void onBufferReceived(byte[] buffer) {
+            mIsHeadlessRetryAllowed = false;
+        }
+
+        @Override
+        public void onEndOfSpeech() {
+        }
+
+        @Override
+        public void onError(int errorCode) {
+            android.util.Log.i(PTT_TAG, "headless take error " + errorCode);
+            boolean isClientOrBusy = errorCode == SpeechRecognizer.ERROR_CLIENT
+                    || errorCode == SpeechRecognizer.ERROR_RECOGNIZER_BUSY;
+            if (isClientOrBusy) {
+                // Do not reuse a recognizer whose connection might be unusable.
+                destroyHeadlessRecognizer();
+            }
+            if (isClientOrBusy && mIsHeadless && mIsHeadlessRetryAllowed
+                    && mHeadlessRetryCount < HEADLESS_RETRY_MAX
+                    && System.currentTimeMillis() - mHeadlessStartTime <= HEADLESS_RETRY_WINDOW_MS) {
+                mIsHeadlessRetryAllowed = false;
+                mHeadlessRetryCount++;
+                android.util.Log.i(PTT_TAG, "headless take retry " + mHeadlessRetryCount);
+                mHandler.postDelayed(mRetryHeadless, HEADLESS_RETRY_DELAY_MS);
+                return;
+            }
+            endHeadless();
+        }
+
+        @Override
+        public void onPartialResults(Bundle bundle) {
+            mIsHeadlessRetryAllowed = false;
+        }
+
+        @Override
+        public void onEvent(int eventType, Bundle params) {
+        }
+
+        @Override
+        public void onResults(Bundle bundle) {
+            ArrayList<String> results = bundle.getStringArrayList(SpeechRecognizer.RESULTS_RECOGNITION);
+            if (results != null && !results.isEmpty()) {
+                deliverHeadless(results);
+            } else {
+                android.util.Log.i(PTT_TAG, "headless take: no results");
+            }
+            endHeadless();
+        }
     }
 
     /**
@@ -284,10 +521,9 @@ public class SpeechInputMethodService extends InputMethodService {
 
     private void startPendingPtt() {
         mIsInputViewStarted = true;
-        if (System.currentTimeMillis() < mPttPendingUntil) {
+        if (mIsPttPending) {
             startPtt();
         }
-        mPttPendingUntil = 0;
     }
 
     /**
