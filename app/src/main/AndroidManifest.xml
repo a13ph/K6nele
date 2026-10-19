@@ -17,6 +17,13 @@
     -->
     <uses-permission android:name="android.permission.INTERNET" />
 
+    <!-- Permissions FOREGROUND_SERVICE and FOREGROUND_SERVICE_MICROPHONE.
+    Used by PttMicService, which a root helper starts so that push-to-talk can record while the
+    keyboard panel is hidden. Non-dangerous permissions, i.e. granted automatically at install time.
+    -->
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MICROPHONE" />
+
     <!-- Permission READ_EXTERNAL_STORAGE is sometimes required when importing rewrite rules,
     e.g. when opening rules via Firefox or Dropbox. (It is not needed via Chrome.)
     This is a "dangerous" permission, i.e. it is not enabled by default. Kõnele currently does not
@@ -475,6 +482,13 @@ Also, failed to set the launchMode from the resource, INSTALL_PARSE_FAILED_UNEXP
                 android:name="android.speech"
                 android:resource="@xml/recognition_service_http" />
         </service>
+
+        <!-- Not exported: only root, the system or Kõnele itself can start it. -->
+        <service
+            android:name=".service.PttMicService"
+            android:exported="false"
+            android:foregroundServiceType="microphone"
+            android:process=":service" />
 
         <service
             android:name=".service.SpeechInputMethodService"
