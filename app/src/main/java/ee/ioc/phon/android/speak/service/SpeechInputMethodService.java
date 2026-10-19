@@ -29,6 +29,7 @@ import android.view.inputmethod.InputMethodSubtype;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
+import androidx.core.content.ContextCompat;
 
 import java.util.List;
 
@@ -131,11 +132,8 @@ public class SpeechInputMethodService extends InputMethodService {
         IntentFilter filter = new IntentFilter();
         filter.addAction(ACTION_PTT_START);
         filter.addAction(ACTION_PTT_STOP);
-        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.TIRAMISU) {
-            registerReceiver(mPttReceiver, filter, Manifest.permission.WRITE_SECURE_SETTINGS, null, Context.RECEIVER_EXPORTED);
-        } else {
-            registerReceiver(mPttReceiver, filter, Manifest.permission.WRITE_SECURE_SETTINGS, null);
-        }
+        ContextCompat.registerReceiver(this, mPttReceiver, filter, Manifest.permission.WRITE_SECURE_SETTINGS, null,
+                ContextCompat.RECEIVER_EXPORTED);
     }
 
     @Override
